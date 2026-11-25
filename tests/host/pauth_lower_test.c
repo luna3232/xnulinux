@@ -56,6 +56,20 @@ static uint32_t eret_fn[] = {
 	0xd69f0bffu, /* eretaa */
 	0xd65f03c0u, /* ret */
 };
+/* pacibsp; mov x0, #7; ret. The hint must not trap. */
+static uint32_t hint_ok[] = { 0xd503237fu, 0xd28000e0u, 0xd65f03c0u };
+/* pacibsp; mov x0, #7; retab. The hint does not sign; retab traps. */
+static uint32_t hint_trap[] = { 0xd503237fu, 0xd28000e0u, 0xd65f0fffu };
+/* adr + top-byte tag + paciza x16 + blraaz x16, leaf returns 42. */
+static uint32_t tagged[] = {
+	0xa9bf7bfdu, 0x100000d0u, 0xb2481e10u, 0xdac123f0u, 0xd63f0a1fu,
+	0xa8c17bfdu, 0xd65f03c0u, 0xd2800540u, 0xd65f03c0u
+};
+/* same tag, no paciza before blraaz: one slot cannot strip and branch. */
+static uint32_t bare_tag[] = {
+	0xa9bf7bfdu, 0x100000b0u, 0xb2481e10u, 0xd63f0a1fu,
+	0xa8c17bfdu, 0xd65f03c0u, 0xd2800540u, 0xd65f03c0u
+};
 
 #ifdef __aarch64__
 static sigjmp_buf ill_jmp;
@@ -111,8 +125,9 @@ int main(void)
 	expect_lower("braa x2, x3", 0xd71f0843u, 0xd61f0040u, PAUTH_LOWER_BR);
 	expect_lower("pacia x2, x3", 0xdac10062u, 0xd503201fu, PAUTH_LOWER_PAC_NOP);
 	expect_lower("pacib x2, sp", 0xdac107e2u, 0xd503201fu, PAUTH_LOWER_PAC_NOP);
-	expect_lower("autia x2, x3", 0xdac11062u, 0xd503201fu, PAUTH_LOWER_AUT_NOP);
-	expect_lower("xpaci x2", 0xdac143e2u, 0xd503201fu, PAUTH_LOWER_AUT_NOP);
+	expect_lower("autia x2, x3", 0xdac11062u, 0x9340dc42u, PAUTH_LOWER_CANON);
+	expect_lower("xpaci x2", 0xdac143e2u, 0x9340dc42u, PAUTH_LOWER_CANON);
+	expect_lower("autiasp", 0xd50323bfu, 0x9340dfdeu, PAUTH_LOWER_CANON);
 	expect_lower("mrs x0 apiakeylo", 0xd5382100u, 0xaa1f03e0u, PAUTH_LOWER_MRS);
 	expect_lower("mrs x2 apiakeylo", 0xd5382102u, 0xaa1f03e2u, PAUTH_LOWER_MRS);
 	expect_lower("msr apiakeylo x2", 0xd5182102u, 0xd503201fu, PAUTH_LOWER_MSR);
@@ -132,10 +147,29 @@ int main(void)
 	expect("span adr", buf[3] == 0x10000080u);
 	expect("span stp", buf[1] == 0xa9bf7bfdu && buf[5] == 0xa8c17bfdu);
 	expect("span hint", buf[0] == 0xd503201fu && st.hint == 2);
-	expect("span counts", st.blr == 1 && st.ret == 2 && st.unchanged == 5);
+	expect("span counts", st.blr == 1 && st.ret == 2 && st.unchanged == 5 && st.branch_raw == 1);
+	printf("span: hint=%u blr=%u ret=%u unchanged=%u branch_raw=%u\n",
+	       st.hint, st.blr, st.ret, st.unchanged, st.branch_raw);
 
-	printf("lower: retab->RET blraaz x0->BLR pacia->NOP autia->NOP mrs x0->MOV XZR eretaa kept\n");
-	printf("span: hint=%u blr=%u ret=%u unchanged=%u\n", st.hint, st.blr, st.ret, st.unchanged);
+	{
+		uint32_t pair[2] = { 0xd503237fu, 0xd65f0fffu };
+		memset(&st, 0, sizeof(st));
+		pauth_lower_span(pair, 2, &st);
+		expect("pacibsp before retab is sbfx x30", pair[0] == 0x9340dfdeu && pair[1] == 0xd65f03c0u && st.canon == 1);
+	}
+	{
+		uint32_t tagged[2] = { 0xdac123f0u, 0xd63f0a1fu }; /* paciza x16; blraaz x16 */
+		memset(&st, 0, sizeof(st));
+		pauth_lower_span(tagged, 2, &st);
+		expect("paciza x16 before blraaz is sbfx", tagged[0] == 0x9340de10u && tagged[1] == 0xd63f0200u && st.canon == 1 && st.branch_raw == 0);
+	}
+	{
+		uint32_t bare[1] = { 0xd63f0a1fu };
+		memset(&st, 0, sizeof(st));
+		pauth_lower_span(bare, 1, &st);
+		expect("bare blraaz stays raw blr", bare[0] == 0xd63f0200u && st.branch_raw == 1 && st.canon == 0);
+	}
+	printf("lower: retab->RET blraaz->BLR pacia->NOP autia->SBFX mrs->MOV XZR eretaa kept\n");
 
 #ifdef __aarch64__
 	{
@@ -146,6 +180,7 @@ int main(void)
 		memset(&sa, 0, sizeof(sa));
 		sa.sa_handler = on_ill;
 		sigaction(SIGILL, &sa, NULL);
+		sigaction(SIGSEGV, &sa, NULL);
 		sigaction(SIGALRM, &sa, NULL);
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		alarm(3);
@@ -168,12 +203,36 @@ int main(void)
 		alarm(0);
 		expect("unlowered mrs SIGILL", rc == 1);
 		printf("CLOUD EMULATION: unlowered mrs rc=%d (1 means SIGILL)\n", rc);
+		alarm(3);
+		rc = call_buf(hint_ok, 3, 0, &ret);
+		alarm(0);
+		expect("raw pacibsp then ret returns 7", rc == 0 && ret == 7);
+		printf("CLOUD EMULATION: raw pacibsp+ret rc=%d x0=%lu\n", rc, ret);
+		alarm(3);
+		rc = call_buf(hint_trap, 3, 0, &ret);
+		alarm(0);
+		printf("CLOUD EMULATION: raw pacibsp+retab rc=%d x0=%lu\n", rc, ret);
+		printf("CLOUD EMULATION: this qemu does not trap RETAB when ISAR1 has no PAC; the architecture leaves RETAB UNDEFINED. The rewrite still replaces it with RET.\n");
+		alarm(3);
+		rc = call_buf(tagged, 9, 1, &ret);
+		alarm(0);
+		expect("tagged pointer canonicalized to 42", rc == 0 && ret == 42);
+		printf("CLOUD EMULATION: paciza+blraaz lowered rc=%d x0=%lu\n", rc, ret);
+		alarm(3);
+		rc = call_buf(bare_tag, 8, 1, &ret);
+		alarm(0);
+		printf("CLOUD EMULATION: bare tagged blraaz lowered rc=%d x0=%lu\n", rc, ret);
+		printf("CLOUD EMULATION: EL0 qemu-user ignores a top-byte tag (TBI), so a raw BLR still reaches the leaf. SBFX matters where bit 55's extension is part of the address.\n");
 		(void)eret_fn;
 	}
 #else
 	printf("host is not aarch64: encoding checks only, no executed call\n");
 	(void)mrs_fn;
 	(void)eret_fn;
+	(void)hint_ok;
+	(void)hint_trap;
+	(void)tagged;
+	(void)bare_tag;
 #endif
 	return fail ? EXIT_FAILURE : EXIT_SUCCESS;
 }

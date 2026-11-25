@@ -1244,7 +1244,8 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		logkv("xnu: nopauth BLRA* rewritten", xnu_lower_stats.blr);
 		logkv("xnu: nopauth BRA* rewritten", xnu_lower_stats.br);
 		logkv("xnu: nopauth PAC inserts nopped", xnu_lower_stats.pac_nop);
-		logkv("xnu: nopauth AUT/XPAC nopped", xnu_lower_stats.aut_nop);
+		logkv("xnu: nopauth pointers canonicalized", xnu_lower_stats.canon);
+		logkv("xnu: nopauth branches left raw", xnu_lower_stats.branch_raw);
 		logkv("xnu: nopauth MRS key -> XZR", xnu_lower_stats.mrs);
 		logkv("xnu: nopauth MSR key nopped", xnu_lower_stats.msr);
 		logkv("xnu: nopauth HINT PAC rewritten to NOP", xnu_lower_stats.hint);
@@ -1380,8 +1381,8 @@ static int xnu_pauth_gate(void)
 	}
 	xnu_nopauth_lower = 1;
 	logs_alert("xnu: nopauth: experimental. Guest PAC instructions are rewritten; pointers are not authenticated. Not macOS support.");
-	logs_alert("xnu: nopauth: RETAB->RET, BLRA*->BLR, BRA*->BR, PAC/AUT/XPAC and HINT PAC->NOP, MRS key->MOV XZR, MSR key->NOP. ERETAA/ERETAB are not rewritten.");
-	logs_alert("xnu: nopauth: a pointer that already has PAC bits in the high half is still that bit pattern after BLRAAZ becomes BLR.");
+	logs_alert("xnu: nopauth: RETAB->RET, BLRA*->BLR, BRA*->BR. PACIBSP is already a NOP without FEAT_PAuth and is rewritten to NOP. AUT/XPAC->SBFX. ERETAA/ERETAB are not rewritten.");
+	logs_alert("xnu: nopauth: SBFX is placed in a PAC insert immediately before BLRA*/BRA* of the same register, or in PACIBSP immediately before RETAB. A bare BLRA* stays a raw branch.");
 	return 0;
 }
 
