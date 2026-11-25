@@ -14,6 +14,7 @@
 #include "macho.h"
 #include "adt.h"
 #include "world.h"
+#include "pauth_lower.h"
 #include "../xnu-patches/include/linux64_abi.h"
 
 static char *image = "xnu/kernel.macho";
@@ -23,11 +24,13 @@ module_param(mode, int, 0444);
 /* pauth_probe: log FEAT_PAuth and return before firmware, files, or contiguous DRAM. */
 static int pauth_probe;
 module_param(pauth_probe, int, 0444);
-/* nopauth: on a host with no FEAT_PAuth, log why the guest is still not entered. Does not enter it. */
+/* nopauth: on a host with no FEAT_PAuth, rewrite guest PAC instructions and enter. Experimental, unsafe. */
 static int nopauth;
 module_param(nopauth, int, 0444);
+extern int xnu_nopauth_lower;
+extern struct pauth_lower_stats xnu_lower_stats;
 MODULE_PARM_DESC(pauth_probe, "log host FEAT_PAuth and return before any image or DRAM allocation");
-MODULE_PARM_DESC(nopauth, "record why an arm64e guest still cannot run without FEAT_PAuth; does not enter it");
+MODULE_PARM_DESC(nopauth, "experimental: rewrite guest PAC ops to RET/BLR/NOP and enter; PAC checks are gone");
 static int ram_mb = 256;
 module_param(ram_mb, int, 0444);
 static int kmax;	/* end the run after this many XNU kprintf lines (0: no limit) */
@@ -1236,6 +1239,17 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		cpu_thread[c] = fki_thread_start(cpu_fn, (void *)(unsigned long)c, c, "xnu-cpu");
 		if (!cpu_thread[c]) { logkv("xnu: cannot make a thread for CPU, running with CPUs below it:", (u64_t)c); cpus = c; }
 	}
+	if (xnu_nopauth_lower) {
+		logkv("xnu: nopauth RETAA/RETAB rewritten", xnu_lower_stats.ret);
+		logkv("xnu: nopauth BLRA* rewritten", xnu_lower_stats.blr);
+		logkv("xnu: nopauth BRA* rewritten", xnu_lower_stats.br);
+		logkv("xnu: nopauth PAC inserts nopped", xnu_lower_stats.pac_nop);
+		logkv("xnu: nopauth AUT/XPAC nopped", xnu_lower_stats.aut_nop);
+		logkv("xnu: nopauth MRS key -> XZR", xnu_lower_stats.mrs);
+		logkv("xnu: nopauth MSR key nopped", xnu_lower_stats.msr);
+		logkv("xnu: nopauth HINT PAC rewritten to NOP", xnu_lower_stats.hint);
+		logkv("xnu: nopauth ERETAA/ERETAB left in place", xnu_lower_stats.refused);
+	}
 	logs("xnu: entering arm_init");
 	in_xnu = 1;
 	long r = xnu_world_call(a_init, (unsigned long)ba);
@@ -1356,16 +1370,19 @@ static int xnu_pauth_gate(void)
 		return 0;
 	}
 	logs_alert("xnu: host FEAT_PAuth absent. Original fki_enter would MRS APIAKEYLO_EL1, which is UNDEFINED. Key registers not touched.");
-	if (nopauth) {
-		logs_alert("xnu: nopauth refused: guest arm64e uses RETAB, BLRAAZ and PACIA, all UNDEFINED without FEAT_PAuth.");
-		logs_alert("xnu: HINT-space PACIASP would NOP; Apple's arm64e epilogue is RETAB. QARMA3 (APA3/GPA3) is not Apple's algorithm and is not implemented.");
-		logs_alert("xnu: nopauth does not enter the guest and does not allocate its DRAM.");
-	} else {
-		logs_alert("xnu: not entering the guest. nopauth=1 records the same barrier and still does not enter.");
-	}
-	if (pauth_probe)
+	if (pauth_probe) {
 		logs_alert("xnu: pauth_probe: no image opened, no contiguous DRAM allocated.");
-	return -EOPNOTSUPP;
+		return -EOPNOTSUPP;
+	}
+	if (!nopauth) {
+		logs_alert("xnu: not entering. nopauth=1 rewrites guest PAC instructions to RET/BLR/NOP and enters. That drops guest PAC checks.");
+		return -EOPNOTSUPP;
+	}
+	xnu_nopauth_lower = 1;
+	logs_alert("xnu: nopauth: experimental. Guest PAC instructions are rewritten; pointers are not authenticated. Not macOS support.");
+	logs_alert("xnu: nopauth: RETAB->RET, BLRA*->BLR, BRA*->BR, PAC/AUT/XPAC and HINT PAC->NOP, MRS key->MOV XZR, MSR key->NOP. ERETAA/ERETAB are not rewritten.");
+	logs_alert("xnu: nopauth: a pointer that already has PAC bits in the high half is still that bit pattern after BLRAAZ becomes BLR.");
+	return 0;
 }
 
 static int __init xnu_init(void)

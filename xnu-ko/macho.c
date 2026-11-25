@@ -4,6 +4,10 @@
 #define ENOEXEC 8
 #define ENOMEM 12
 #include "macho.h"
+#include "pauth_lower.h"
+
+int xnu_nopauth_lower;
+struct pauth_lower_stats xnu_lower_stats;
 
 #define FOR_EACH_LC(img, l) \
 	for (const struct lc *l = (const void *)((img)->file + sizeof(struct mh64)), *_e = (const void *)((img)->file + sizeof(struct mh64) + ((const struct mh64 *)(img)->file)->sizeofcmds); \
@@ -81,13 +85,31 @@ int macho_copy(struct xnu_image *img, void *dst)
 		if (!s->vmsize || !s->filesize || !x_strncmp(s->segname, "__PAGEZERO", 16)) continue;
 		if (s->fileoff + s->filesize > img->file_size) return -ENOEXEC;
 		x_memcpy((char *)dst + (s->vmaddr - img->vmlow), img->file + s->fileoff, s->filesize);
+		if (xnu_nopauth_lower && (s->initprot & 4)) {
+			const struct sect64 *sc = (const void *)(s + 1);
+			u32_t i;
+			for (i = 0; i < s->nsects; i++) {
+				unsigned char *p;
+				if (!(sc[i].flags & 0x80000400u)) continue;	/* pure or some instructions */
+				if ((sc[i].addr | sc[i].size) & 3) continue;
+				if (sc[i].size == 0) continue;
+				if (sc[i].addr < img->vmlow || sc[i].addr + sc[i].size > img->vmhigh) continue;
+				if ((u64_t)sc[i].offset < s->fileoff ||
+				    (u64_t)sc[i].offset + sc[i].size > s->fileoff + s->filesize)
+					continue;
+				p = (unsigned char *)dst + (sc[i].addr - img->vmlow);
+				pauth_lower_span((uint32_t *)p, (size_t)(sc[i].size / 4), &xnu_lower_stats);
+			}
+		}
 	}
 	return 0;
 }
 
-/* Non-HINT PACIA/PACIB/PACDA/PACDB. UNDEFINED when FEAT_PAuth is absent; xnu_init does not reach this then. */
+/* Non-HINT PACIA/PACIB/PACDA/PACDB. With nopauth the pointer is left raw; the guest's PAC/AUT were rewritten to NOP. */
 static inline u64_t sign(u64_t v, unsigned key, u64_t disc)
 {
+	if (xnu_nopauth_lower)
+		return v;
 	switch (key) {
 	case 0: asm volatile(".arch_extension pauth\n\tpacia %0, %1" : "+r"(v) : "r"(disc)); break;
 	case 1: asm volatile(".arch_extension pauth\n\tpacib %0, %1" : "+r"(v) : "r"(disc)); break;
