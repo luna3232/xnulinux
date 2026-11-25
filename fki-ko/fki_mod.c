@@ -8,6 +8,7 @@
  */
 #include "fki.h"
 #include "fki_internal.h"
+#include "fki_pauth.h"
 #include <linux/firmware.h>
 #include <linux/gfp.h>
 #include <linux/irqflags.h>
@@ -163,9 +164,71 @@ EXPORT_SYMBOL(fki_blob_put);
 
 #define FKI_SCTLR_EN (SCTLR_ELx_ENIA | SCTLR_ELx_ENIB | SCTLR_ELx_ENDA | SCTLR_ELx_ENDB)
 
+/* -1 until the ID registers have been read. 1: key registers exist. 0: they are UNDEFINED. */
+static int fki_pauth_level = -1;
+static u64 fki_pauth_isar1, fki_pauth_isar2, fki_pauth_sctlr, fki_pauth_el;
+
+static void fki_pauth_detect(void)
+{
+	struct fki_pauth_id id;
+
+	if (smp_load_acquire(&fki_pauth_level) >= 0)
+		return;
+	fki_pauth_isar1 = read_sysreg_s(SYS_ID_AA64ISAR1_EL1);
+	fki_pauth_isar2 = read_sysreg_s(SYS_ID_AA64ISAR2_EL1);
+	fki_pauth_sctlr = read_sysreg(sctlr_el1);
+	fki_pauth_el = read_sysreg(CurrentEL);
+	fki_pauth_decode(fki_pauth_isar1, fki_pauth_isar2, &id);
+	/* CurrentEL is the raw register: EL1 reads as 4 (EL in bits [3:2]). Quiet consoles still show the absent case. */
+	if (id.present)
+		pr_info("fki: pauth isar1=%#llx isar2=%#llx sctlr_el1=%#llx CurrentEL=%#llx EL%llu apa=%u api=%u gpa=%u gpi=%u apa3=%u gpa3=%u present=%u\n",
+			fki_pauth_isar1, fki_pauth_isar2, fki_pauth_sctlr, fki_pauth_el, fki_pauth_el >> 2,
+			id.apa, id.api, id.gpa, id.gpi, id.apa3, id.gpa3, id.present);
+	else
+		pr_alert("fki: pauth isar1=%#llx isar2=%#llx sctlr_el1=%#llx CurrentEL=%#llx EL%llu apa=%u api=%u gpa=%u gpi=%u apa3=%u gpa3=%u present=%u; PAC key registers are UNDEFINED and will not be read or written\n",
+			 fki_pauth_isar1, fki_pauth_isar2, fki_pauth_sctlr, fki_pauth_el, fki_pauth_el >> 2,
+			 id.apa, id.api, id.gpa, id.gpi, id.apa3, id.gpa3, id.present);
+	smp_store_release(&fki_pauth_level, id.present ? 1 : 0);
+}
+
+int fki_pauth_status(fki_u64 *isar1, fki_u64 *isar2, fki_u64 *sctlr_el1, fki_u64 *current_el, fki_u64 *fields)
+{
+	struct fki_pauth_id id;
+
+	fki_pauth_detect();
+	fki_pauth_decode(fki_pauth_isar1, fki_pauth_isar2, &id);
+	if (isar1)
+		*isar1 = fki_pauth_isar1;
+	if (isar2)
+		*isar2 = fki_pauth_isar2;
+	if (sctlr_el1)
+		*sctlr_el1 = fki_pauth_sctlr;
+	if (current_el)
+		*current_el = fki_pauth_el;
+	if (fields)
+		*fields = fki_pauth_pack(&id);
+	return READ_ONCE(fki_pauth_level) > 0;
+}
+EXPORT_SYMBOL(fki_pauth_status);
+
+__attribute__((target("branch-protection=none")))
+static int fki_pauth_keys_ok(void)
+{
+	/*
+	 * Cached by fki_init, before any world switch. fki_leave and fki_pac_swap call this while the foreign
+	 * keys are live, so it must not call printk or anything else signed with the host keys.
+	 * Unknown (init did not run) stays "do not touch the key registers".
+	 */
+	return smp_load_acquire(&fki_pauth_level) > 0;
+}
 
 static __always_inline void keys_read(struct fki_pac_keys *k)
 {
+	/* ID registers said the key registers are UNDEFINED: do not MRS them (it is an undef at EL1). */
+	if (!fki_pauth_keys_ok()) {
+		memset(k, 0, sizeof(*k));
+		return;
+	}
 	k->ia[0] = read_sysreg_s(SYS_APIAKEYLO_EL1); k->ia[1] = read_sysreg_s(SYS_APIAKEYHI_EL1);
 	k->ib[0] = read_sysreg_s(SYS_APIBKEYLO_EL1); k->ib[1] = read_sysreg_s(SYS_APIBKEYHI_EL1);
 	k->da[0] = read_sysreg_s(SYS_APDAKEYLO_EL1); k->da[1] = read_sysreg_s(SYS_APDAKEYHI_EL1);
@@ -176,6 +239,8 @@ static __always_inline void keys_read(struct fki_pac_keys *k)
 
 static __always_inline void keys_write(const struct fki_pac_keys *k)
 {
+	if (!fki_pauth_keys_ok())
+		return;
 	write_sysreg_s(k->ia[0], SYS_APIAKEYLO_EL1); write_sysreg_s(k->ia[1], SYS_APIAKEYHI_EL1);
 	write_sysreg_s(k->ib[0], SYS_APIBKEYLO_EL1); write_sysreg_s(k->ib[1], SYS_APIBKEYHI_EL1);
 	write_sysreg_s(k->da[0], SYS_APDAKEYLO_EL1); write_sysreg_s(k->da[1], SYS_APDAKEYHI_EL1);
@@ -974,6 +1039,8 @@ static int __init fki_init(void)
 	struct net_device *dev;
 	int err, cpu;
 
+	/* Process context, IRQs on. The ID registers only; PAC key registers stay untouched. */
+	fki_pauth_detect();
 	for_each_possible_cpu(cpu) {
 		struct page *pg = alloc_pages(GFP_KERNEL, FKI_ALT_STACK_ORDER);
 

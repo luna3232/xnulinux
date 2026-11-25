@@ -20,6 +20,14 @@ static char *image = "xnu/kernel.macho";
 module_param(image, charp, 0444);
 static int mode = 2;
 module_param(mode, int, 0444);
+/* pauth_probe: log FEAT_PAuth and return before firmware, files, or contiguous DRAM. */
+static int pauth_probe;
+module_param(pauth_probe, int, 0444);
+/* nopauth: on a host with no FEAT_PAuth, log why the guest is still not entered. Does not enter it. */
+static int nopauth;
+module_param(nopauth, int, 0444);
+MODULE_PARM_DESC(pauth_probe, "log host FEAT_PAuth and return before any image or DRAM allocation");
+MODULE_PARM_DESC(nopauth, "record why an arm64e guest still cannot run without FEAT_PAuth; does not enter it");
 static int ram_mb = 256;
 module_param(ram_mb, int, 0444);
 static int kmax;	/* end the run after this many XNU kprintf lines (0: no limit) */
@@ -1318,6 +1326,48 @@ static int run_m2b(void)
 	return enter_arm_init(ba);
 }
 
+/*
+ * Host pointer authentication. On a CPU with FEAT_PAuth the original key switch is unchanged.
+ * Without it, fki_enter's MRS/MSR of APIAKey*_EL1 (and the other four pairs) is UNDEFINED, and so
+ * are the guest's non-HINT PAC instructions (RETAB, BLRAAZ, PACIA Xd,Xn, MSR of the same keys).
+ * HINT-space PACIASP/AUTIASP would NOP; Apple arm64e returns with RETAB. QARMA3 (APA3/GPA3) is a
+ * different algorithm from Apple's implementation-defined one, and it is not implemented here when
+ * those fields are zero. Neither fact makes the guest runnable. No image is opened and no contiguous
+ * DRAM is allocated on the way out.
+ * Returns 0 to continue, 1 when pauth_probe finished on a PAC host, or -errno.
+ */
+static int xnu_pauth_gate(void)
+{
+	fki_u64 isar1 = 0, isar2 = 0, sctlr = 0, el = 0, fields = 0;
+	int present = fki_pauth_status(&isar1, &isar2, &sctlr, &el, &fields);
+
+	logkv("xnu: pauth isar1", isar1);
+	logkv("xnu: pauth isar2", isar2);
+	logkv("xnu: pauth sctlr_el1", sctlr);
+	logkv("xnu: pauth CurrentEL", el);
+	logkv("xnu: pauth fields apa.api.gpa.gpi.apa3.gpa3", fields);
+	if (present) {
+		if (nopauth)
+			logs_alert("xnu: nopauth ignored: host FEAT_PAuth is present; original PAC key switch stays");
+		if (pauth_probe) {
+			logs_alert("xnu: pauth_probe: FEAT_PAuth present. No image opened, no DRAM allocated.");
+			return 1;
+		}
+		return 0;
+	}
+	logs_alert("xnu: host FEAT_PAuth absent. Original fki_enter would MRS APIAKEYLO_EL1, which is UNDEFINED. Key registers not touched.");
+	if (nopauth) {
+		logs_alert("xnu: nopauth refused: guest arm64e uses RETAB, BLRAAZ and PACIA, all UNDEFINED without FEAT_PAuth.");
+		logs_alert("xnu: HINT-space PACIASP would NOP; Apple's arm64e epilogue is RETAB. QARMA3 (APA3/GPA3) is not Apple's algorithm and is not implemented.");
+		logs_alert("xnu: nopauth does not enter the guest and does not allocate its DRAM.");
+	} else {
+		logs_alert("xnu: not entering the guest. nopauth=1 records the same barrier and still does not enter.");
+	}
+	if (pauth_probe)
+		logs_alert("xnu: pauth_probe: no image opened, no contiguous DRAM allocated.");
+	return -EOPNOTSUPP;
+}
+
 static int __init xnu_init(void)
 {
 	const void *data; unsigned long size;
@@ -1325,6 +1375,9 @@ static int __init xnu_init(void)
 
 	if (fki_version() != 0)
 		return -22;
+	err = xnu_pauth_gate();
+	if (err)
+		return err < 0 ? err : 0;
 	/* every random number XNU takes comes from Linux's generator (the boot seeds, LINUX64_CALL_RANDOM): seeded first */
 	err = fki_random_wait();
 	if (err) { logkv("xnu: Linux's random number generator is not seeded, err", (u64_t)err); return err; }

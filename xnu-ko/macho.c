@@ -85,6 +85,7 @@ int macho_copy(struct xnu_image *img, void *dst)
 	return 0;
 }
 
+/* Non-HINT PACIA/PACIB/PACDA/PACDB. UNDEFINED when FEAT_PAuth is absent; xnu_init does not reach this then. */
 static inline u64_t sign(u64_t v, unsigned key, u64_t disc)
 {
 	switch (key) {

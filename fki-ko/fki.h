@@ -51,6 +51,13 @@ unsigned long fki_enter(const struct fki_pac_keys *foreign, struct fki_pac_keys 
 void fki_leave(unsigned long cookie, const struct fki_pac_keys *saved);
 /* Swap PAC keys only (caller already in a foreign context): save current into *save, load *load. */
 void fki_pac_swap(const struct fki_pac_keys *load, struct fki_pac_keys *save);
+/*
+ * Host FEAT_PAuth from ID_AA64ISAR1_EL1 and ID_AA64ISAR2_EL1 only. Does not read or write PAC key
+ * registers. Returns 1 when address or generic authentication is implemented (APA, API, GPA, GPI, APA3
+ * or GPA3), 0 when none is. NULL pointers are skipped. *fields packs one nibble each: APA, API, GPA,
+ * GPI, APA3, GPA3 (see fki_pauth.h).
+ */
+int fki_pauth_status(fki_u64 *isar1, fki_u64 *isar2, fki_u64 *sctlr_el1, fki_u64 *current_el, fki_u64 *fields);
 fki_u64 fki_counter_frequency(void);
 fki_u64 fki_counter(void);
 void fki_random(void *buf, unsigned long len);
