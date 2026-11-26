@@ -49,41 +49,55 @@ When those fields are zero, FEAT_PAuth is not implemented. From the Arm A64 desc
 
 There is no architectural “emulate PAC at EL1” trap on a CPU that does not implement the feature. `HCR_EL2.API` exists only when FEAT_PAuth is implemented, and this host is EL1, not EL2.
 
-## Why a trap cannot be integrated safely from here
+## Stock-kernel undef hook is closed
 
-Upstream Linux **v6.6** `arch/arm64/kernel/traps.c` (the board is `6.6.9-qcomlt`, which was **not** available to diff):
+RB5主管 reported the following for the exact running kernel `6.6.9-qcomlt-arm64-00188-g31f49428dc7d`. This note records that handover. It does not claim an independent hash of the qcom tree.
 
-```c
-void do_el1_undef(struct pt_regs *regs, unsigned long esr)
-{
-	/* read the insn; if that fails, die */
-	if (try_emulate_el1_ssbs(regs, insn))
-		return;
-	die("Oops - Undefined instruction", regs, esr);
-}
-```
+| File | Supervisor's report |
+|---|---|
+| `arch/arm64/kernel/traps.c` | Byte-for-byte match of Linux v6.6.9. SHA-256 `edc9b0ed19c1602906db6b17358823559135727df749053ec3f1e1542e55bd57`. |
+| `arch/arm64/kernel/entry-common.c` | Byte-for-byte match of Linux v6.6.9. SHA-256 `0d4c8e4c7b004122baa19b20fafd4c0bcd94cfcd825c4dd8d251f1cd76c8529e`. |
 
-`register_undef_hook` is not in that file. EL1 undefined instructions are not dispatched to a module hook list. `do_el1_undef` either emulates SSBS or calls `die()`. `die()` takes `die_lock`, marks an oops, and (unless `notify_die` returns `NOTIFY_STOP`) calls `make_task_dead()`.
+From that same report:
 
-`fki_die_pre` is a kprobe **pre**-handler, so it runs before that body and can skip `die()` by the existing “set the probed PC to x30 and return 1” trick. That is still the wrong place to put untested control-flow emulation:
+- `do_el1_undef` (`traps.c` 475–487) calls `try_emulate_el1_ssbs` and otherwise `die("Oops - Undefined instruction")`. There is no `register_undef_hook`.
+- `do_el0_undef` ends in `SIGILL`.
+- `el1h_64_sync_handler` sends `EC_SYS64` and `EC_UNKNOWN` to `el1_undef`. Only `EC_FPAC` goes to `do_el1_fpac`.
+- Without FEAT_PAuth, `RETAB` is an undefined instruction and takes `EC_UNKNOWN`, not FPAC.
+- `PACIBSP` is a HINT. It does not enter `do_el1_undef`.
+- `try_emulate_el1_ssbs` recognizes only the SSBS `MSR` and is not exported.
+- A rebuild `System.map` did not match the board map. `do_el1_undef` is `ffff800080020bc8` on the board and `ffff800080020ac0` in that rebuild. Rebuilt addresses are not board addresses.
+- Upstream 6.6 also has no general `register_undef_hook`.
 
-- The probe is best-effort (`register_kprobe` failure is a warning, and foreign non-abort exceptions then oops).
-- The same probe is the path for every foreign oops, not only PAC.
-- HINT instructions never arrive. `pacibsp` has already executed as a NOP.
-- The handler would run in exception context. It must not execute a real `MRS` of a PAC key: that instruction is also UNDEFINED and would re-enter `die()`.
-- qcom’s `6.6.9` tree may differ. Do not assume the upstream function is byte-identical.
-- Headers and `Module.symvers` for `6.6.9-qcomlt` built with GCC 10.2-2020.11 are not available here. This branch does not build `fki.ko` or `xnu.ko` and does not invent a vermagic.
+Conclusion from that handover: a stock-kernel undefined-instruction hook is not an integration path. `do_el1_undef` has no registration point a module can attach, `try_emulate_el1_ssbs` is not an exported PAC hook, and EL0 undefined instructions become `SIGILL`.
 
-The arm64e return sequence makes the trap gap concrete. The absent-profile test does this:
+HINT sign points stay outside `do_el1_undef`. A handler that saw only `RETAB` would observe an LR that `PACIBSP` had already left unsigned. The absent-profile test records the same split in the model:
 
 1. `PACIBSP` (HINT `0xd503237f`) returns `SWPAC_NOP`. X30 is unchanged. PC advances by 4.
 2. `RETAB` (integer `0xd65f0fff`) returns `SWPAC_UNDEF`. PC and X30 stay put.
 
-In the experimental profile the same pair signs X30 with key IB and SP, then `RETAB` branches to the authenticated address and **does not write X30 back** (the authenticated address is not written to LR). That second result is the virtual-FEAT_PAuth behaviour. It is not what the RB5 does.
+In the experimental profile the same pair signs X30 with key IB and SP, then `RETAB` branches to the authenticated address and leaves X30 holding the signed value. That is virtual-FEAT_PAuth behaviour inside this model. It is not what the RB5 executes, and it is not macOS execution.
 
-So: native trapped execution of a normal arm64e prologue/epilogue is **not** feasible until the sign and the authenticate are the same kind of instruction. Integer `PACIA`/`BLRAAZ`/`RETAB` can trap. HINT `PACIBSP`/`PACIASP` cannot. This repo does not contain the guest kernel image, so the mix of those forms in the image is **unverified**. `macho.c`’s rebase `pacia` is the integer form and would trap. Many arm64e function prologues are `pacibsp`.
+This branch does not modify `fki_die_pre` or `keys_read`. `fki_die_pre` remains the existing best-effort `die()` probe described above. It is not a PAC emulator.
 
-This branch therefore does **not** register a kprobe, does **not** change `fki_die_pre`, and does **not** change `keys_read`.
+## Software-only options
+
+These are records of what could be done later in software. None of them is implemented on this branch. None of them is macOS execution, an RB5 load, a module build, or a hook registration.
+
+1. **Current deliverable.** The host model and `make test` / `make test-ubsan` / `make fixtures-check` stay the result of this branch. `swpac_step` does not fetch, does not walk page tables, and does not run on the board.
+2. **A future EL1 undefined-instruction emulator.** That would be a change to kernel source plus a rebuild that matches the running `6.6.9-qcomlt-arm64-00188-g31f49428dc7d` image. It would still miss HINT sign points, because `PACIBSP` does not enter `do_el1_undef`. It is out of scope until RB5主管 decides to do it. The board and rebuild addresses above already disagree, so a rebuilt symbol address is not a board address.
+3. **Guest instruction interpretation or binary translation.** That is a separate design. It is not this model, and it is not macOS execution.
+
+Host API the tests call, layout-compatible with `struct fki_pac_keys` (`xnu_world.linux_keys` at 240, `xnu_keys` at 328):
+
+```c
+void swpac_cpu_init(struct swpac_cpu *c, int profile);
+void swpac_keys_swap(struct swpac_cpu *c, const struct swpac_keys *load, struct swpac_keys *save);
+int  swpac_decode(uint32_t insn, struct swpac_dec *d);
+int  swpac_step(struct swpac_cpu *c, uint32_t insn);
+```
+
+`swpac_step` updates X0–X30, SP, and PC only for `SWPAC_OK` and `SWPAC_NOP`. On `SWPAC_UNDEF`, `SWPAC_UNSUPPORTED`, `SWPAC_NOT_PAC`, and `SWPAC_BAD_CONFIG` those registers stay unchanged. `cpu->last` is diagnostic and is updated either way. `swpac.c` is GPL-2.0-only. The header carries the Linux-syscall exception.
 
 ## Subset that is implemented
 
@@ -150,31 +164,6 @@ Refused with `SWPAC_UNSUPPORTED` (state unchanged): `LDRAA/LDRAB`, `ERETAA/ERETA
 `SWPAC_NOT_PAC`: NOP, BTI, plain `RET`, plain `LDR`, `MRS SCTLR_EL1`. State unchanged. The model does not execute generic instructions.
 
 Not implemented, and not silently accepted: FEAT_PAuth_LR’s second modifier, PSTATE.BTYPE / BTI landing-pad checks on `PACIASP`, GCS, MTE field placement, EL0-vs-EL1 enable splitting, EL2/EL3, a guest page-table walk, instruction fetch. `swpac_step` does not read memory. The caller supplies the instruction word.
-
-## Interface for a later trap
-
-`struct swpac_keys` matches `struct fki_pac_keys` (asserted in the host test, including `xnu_world.linux_keys` at 240 and `xnu_keys` at 328).
-
-```c
-void swpac_cpu_init(struct swpac_cpu *c, int profile);
-void swpac_keys_swap(struct swpac_cpu *c, const struct swpac_keys *load, struct swpac_keys *save);
-int  swpac_decode(uint32_t insn, struct swpac_dec *d);
-int  swpac_step(struct swpac_cpu *c, uint32_t insn);
-```
-
-`swpac_step` updates the register file only for `SWPAC_OK` and `SWPAC_NOP`. On `SWPAC_UNDEF`, `SWPAC_UNSUPPORTED`, `SWPAC_NOT_PAC`, and `SWPAC_BAD_CONFIG`, X0–X30, SP, and PC are unchanged. `cpu->last` is diagnostic and is updated either way.
-
-Suggested call, **not applied** on this branch, and only after the qcom tree is confirmed:
-
-1. Module parameter default **off**. No unconditional path.
-2. Prefer a kprobe on `do_el1_undef` that runs **before** `die`, limited to a PC inside the foreign window the fault registration already uses. Do not put this in the shared `die` probe unless that is the only symbol the running kernel actually exports; skipping `die` is the existing fki pattern but it is shared with real oopses.
-3. Copy `pt_regs` into `swpac_cpu` (Linux arm64: `regs->regs[0..30]`, `regs->sp`, `regs->pc` — confirm the struct against the reconstructed headers; do not guess).
-4. Keep one software key file per CPU, laid out as `struct fki_pac_keys`, swapped with the same pairs `world.S` already passes to `fki_enter` / `fki_pac_swap`. Do not MRS the hardware keys.
-5. Call `swpac_step`. Copy the register file back **only** if the status is `SWPAC_OK` or `SWPAC_NOP`. `SWPAC_NOP` will not be seen from an undefined-instruction hook, because HINTs do not trap.
-6. Any other status: do not skip `die`. An unsupported opcode must stay a fault.
-7. The hook must not call `keys_read` / `keys_write`. Those instructions are the trap.
-
-`swpac.c` is GPL-2.0-only. Link it from `fki-ko` if it is linked into the kernel. Do not link it into APSL `xnu.ko`. The header carries the Linux-syscall exception so the struct can be included from the other side; the implementation stays on the GPL side. `macho.c`’s `sign()` can later call an fki export that runs `swpac_add` **only** when the experimental parameter is on. That changes rebase signatures to this mixer. Hardware will not accept them. Leave `sign()` on the inline `pacia` unless that parameter is on.
 
 ## Tests and what they are not
 
