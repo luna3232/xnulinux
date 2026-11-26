@@ -9,6 +9,7 @@
 #include "fki.h"
 #include "fki_internal.h"
 #include "fki_pauth.h"
+#include "fki_symcheck.h"
 #include <linux/firmware.h>
 #include <linux/gfp.h>
 #include <linux/irqflags.h>
@@ -80,6 +81,42 @@ static unsigned long p_stext, p_end;
 static u64 *p_kimage_voffset;
 static int (*p_efi_mem_type)(unsigned long);	/* the firmware's memory map: is the carve-out RAM at all */
 
+/*
+ * Default empty. Runtime addresses for the RB5 System.map in fki_rb5_link, same order.
+ * Used only when set. Checked as one KASLR slide. Not a kallsyms scan.
+ * Fault and die hooks still call register_kprobe; this kernel has no kprobes.
+ */
+static unsigned long sym_runtime[FKI_SYM_N];
+static int sym_runtime_n;
+module_param_array(sym_runtime, ulong, &sym_runtime_n, 0444);
+MODULE_PARM_DESC(sym_runtime, "optional runtime addresses matching fki_rb5_link order; default off");
+
+static int fki_resolve_explicit(void)
+{
+	unsigned long slide = 0;
+
+	if (sym_runtime_n != FKI_SYM_N)
+		return -EINVAL;
+	if (fki_sym_one_slide(fki_rb5_link, sym_runtime, FKI_SYM_N, &slide)) {
+		pr_alert("fki: sym_runtime is not one slide from the RB5 System.map; not using it\n");
+		return -EINVAL;
+	}
+	p_set_memory_x = (set_memory_fn)sym_runtime[0];
+	p_alloc_contig = (alloc_contig_fn)sym_runtime[1];
+	p_free_contig = (free_contig_fn)sym_runtime[2];
+	p_cma_area = (struct cma **)sym_runtime[3];
+	p_cma_alloc = (void *)sym_runtime[4];
+	p_cma_release = (void *)sym_runtime[5];
+	p_set_memory_nx = (set_memory_fn)sym_runtime[6];
+	p_stext = sym_runtime[7];
+	p_end = sym_runtime[8];
+	p_kimage_voffset = (u64 *)sym_runtime[9];
+	p_efi_mem_type = (void *)sym_runtime[10];
+	pr_alert("fki: sym_runtime accepted, slide %#lx. Fault hooks still need kprobes, which this config may not have.\n",
+		 slide);
+	return p_set_memory_x && p_set_memory_nx ? 0 : -ENOENT;
+}
+
 static int fki_resolve(void)
 {
 	static unsigned long (*lookup)(const char *);
@@ -87,6 +124,14 @@ static int fki_resolve(void)
 
 	if (p_set_memory_x)
 		return 0;
+	if (sym_runtime_n) {
+		int err = fki_resolve_explicit();
+
+		if (!err)
+			return 0;
+		pr_alert("fki: sym_runtime rejected (%d); not falling through to a kallsyms scan\n", err);
+		return err;
+	}
 	if (!lookup) {
 		if (register_kprobe(&kp))
 			return -ENOENT;

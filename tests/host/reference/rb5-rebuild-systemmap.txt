@@ -1,0 +1,39 @@
+Reconstruction of 6.6.9-qcomlt-arm64-00188-g31f49428dc7d. Not a verified ABI match.
+
+Source: https://git.codelinaro.org/clo/qcomlt/kernel commit 31f49428dc7d38d1d23b1906ad884fe0a1d718ce
+Makefile at that commit: VERSION=6 PATCHLEVEL=6 SUBLEVEL=9
+Compiler: aarch64-none-linux-gnu-gcc (GNU Toolchain for the A-profile Architecture 10.2-2020.11 (arm-10.16)) 10.2.1 20201103
+Linker: GNU ld (same toolchain) 2.35.1.20201028
+Config input sha256: 53b2285e49c3e3e59069a8c07aa2230d936c205e5cceb168755ae3ef1c250229 (/proc/config)
+No --force-vermagic. No near-version headers.
+
+git describe in this public clone is v6.6.9-681049-g31f49428dc7d, not v6.6.9-188-g....
+Produced include/generated/utsrelease.h:
+  #define UTS_RELEASE "6.6.9-qcomlt-arm64-681049-g31f49428dc7d"
+Running uname -r is 6.6.9-qcomlt-arm64-00188-g31f49428dc7d.
+The 00188 distance is not what this clone's tags produce. Missing artifact: the builder's tag set (or the debian -5 packaging) that made describe say 188. The -5 source dsc returned HTTP 404.
+
+olddefconfig dropped Kconfig symbols that exist in proc-config and not in this commit:
+  # CONFIG_R8168 is not set
+  # CONFIG_R8125 is not set
+  # CONFIG_REALTEK_PGTOOL is not set
+It also set CONFIG_PAHOLE_VERSION=125 and CONFIG_PAHOLE_HAS_SPLIT_BTF / LANG_EXCLUDE because this build host has pahole. The running config has CONFIG_PAHOLE_VERSION=0. CONFIG_DEBUG_INFO_BTF stayed unset.
+
+make O=/tmp/rb5-rebuild/out -j2 vmlinux  EXIT:0
+vmlinux.log sha256 094c4ff4accb9cea85b80a5cbf6f190821559365c9e9c6e13807be3135a88cdc
+built System.map sha256 12653582d6d12bbca43bf10458d7aa1c08700bea547cdcad4db7a05de4c7ee72
+built vmlinux sha256 686b463c22b60fc6982511827ca759b4669ffc7c4b8ae5bea5db33135eee7724
+board System.map sha256 11d372fb432a22e0ea11b5a11cdda4935aa137ad3dfc12c5f300a5d29cf1bdbf
+
+Comparison:
+  board lines 185159 names 129473
+  built lines 185542 names 129772
+  names only in board 472
+  names only in built 771
+  same address and type 118
+  different address or type 128883
+_stext matches (ffff800080010000 T) because that is the arm64 link address.
+_end, set_memory_x, do_el1_undef, kallsyms_lookup_name and the other fki anchors do not match.
+register_kprobe and register_undef_hook are absent from both maps.
+
+This build does not reproduce the running kernel's System.map or vermagic.
