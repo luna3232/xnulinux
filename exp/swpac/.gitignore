@@ -1,0 +1,6 @@
+swpac_test
+swpac_test_asan
+swpac_test_ubsan
+fixtures.o
+fixtures.inc.check
+*.log
