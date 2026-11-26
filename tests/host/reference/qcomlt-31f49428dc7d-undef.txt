@@ -1,0 +1,57 @@
+Target tree: https://git.codelinaro.org/clo/qcomlt/kernel
+commit 31f49428dc7d38d1d23b1906ad884fe0a1d718ce
+title: enable interconnect for Qualcomm SM8250
+Makefile: VERSION=6 PATCHLEVEL=6 SUBLEVEL=9 EXTRAVERSION empty
+
+arch/arm64/kernel/traps.c at that commit is byte-identical to
+linux v6.6.9 traps.c
+sha256 edc9b0ed19c1602906db6b17358823559135727df749053ec3f1e1542e55bd57
+
+arch/arm64/kernel/entry-common.c is byte-identical to linux v6.6.9
+sha256 0d4c8e4c7b004122baa19b20fafd4c0bcd94cfcd825c4dd8d251f1cd76c8529e
+
+do_el1_undef, traps.c lines 475-487:
+  reads the insn with aarch64_insn_read
+  calls try_emulate_el1_ssbs only
+  otherwise die("Oops - Undefined instruction", regs, esr)
+There is no register_undef_hook and no call_undef_hook in this file.
+
+do_el0_undef, traps.c lines 454-473:
+  aarch32_break_handler, try_emulate_mrs, try_emulate_armv8_deprecated,
+  else SIGILL. No generic undef hook.
+
+try_emulate_el1_ssbs, arch/arm64/kernel/proton-pack.c lines 524-539:
+  matches SSBS MSR (instr_val 0xd500401f | PSTATE_SSBS) only.
+  Not exported (no EXPORT_SYMBOL in that file; no __ksymtab in System.map).
+
+entry-common.c el1h_64_sync_handler lines 451-485:
+  ESR_ELx_EC_SYS64 and ESR_ELx_EC_UNKNOWN -> el1_undef (lines 414-421) -> do_el1_undef
+  ESR_ELx_EC_FPAC -> el1_fpac (lines 442-448) -> do_el1_fpac -> die("Oops - FPAC")
+  el1_undef and el0_undef are static. A RETAB without FEAT_PAuth is UNDEFINED,
+  so it is EC_UNKNOWN, not FPAC. FPAC is only the failure exception when PAC exists.
+
+Running kernel System.map
+sha256 11d372fb432a22e0ea11b5a11cdda4935aa137ad3dfc12c5f300a5d29cf1bdbf
+  ffff80008001ff38 T die
+  ffff800080020a04 T do_el0_undef
+  ffff800080020bc8 T do_el1_undef
+  ffff800080020d28 T do_el1_fpac
+  ffff8000800286cc T try_emulate_el1_ssbs
+  ffff800080034478 t __do_kernel_fault
+  ffff80008116db54 t el1_undef
+No symbol register_undef_hook.
+No symbol register_kprobe.
+No __ksymtab_do_el1_undef, __ksymtab_die, or __ksymtab_try_emulate_el1_ssbs.
+T means the symbol is global in the image. It is not a module export.
+t means the symbol is local (static).
+
+/proc/config sha256 53b2285e49c3e3e59069a8c07aa2230d936c205e5cceb168755ae3ef1c250229
+line 721: # CONFIG_KPROBES is not set
+include/linux/kprobes.h lines 465-468 at this commit: if CONFIG_KPROBES is off,
+register_kprobe is a static inline that returns -EOPNOTSUPP. It is not a
+callable export.
+
+A module cannot register an EL1 undef hook on this kernel. The only EL1
+instruction emulator in front of die is try_emulate_el1_ssbs, and it does
+not match PAC, RETAB, or BLRAAZ. PACIBSP is a HINT, so it never reaches
+do_el1_undef.

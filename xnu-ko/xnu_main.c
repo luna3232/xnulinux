@@ -14,12 +14,23 @@
 #include "macho.h"
 #include "adt.h"
 #include "world.h"
+#include "pauth_lower.h"
 #include "../xnu-patches/include/linux64_abi.h"
 
 static char *image = "xnu/kernel.macho";
 module_param(image, charp, 0444);
 static int mode = 2;
 module_param(mode, int, 0444);
+/* pauth_probe: log FEAT_PAuth and return before firmware, files, or contiguous DRAM. */
+static int pauth_probe;
+module_param(pauth_probe, int, 0444);
+/* nopauth: on a host with no FEAT_PAuth, rewrite guest PAC instructions and enter. Experimental, unsafe. */
+static int nopauth;
+module_param(nopauth, int, 0444);
+extern int xnu_nopauth_lower;
+extern struct pauth_lower_stats xnu_lower_stats;
+MODULE_PARM_DESC(pauth_probe, "log host FEAT_PAuth and return before any image or DRAM allocation");
+MODULE_PARM_DESC(nopauth, "experimental: rewrite guest PAC ops to RET/BLR/NOP and enter; PAC checks are gone");
 static int ram_mb = 256;
 module_param(ram_mb, int, 0444);
 static int kmax;	/* end the run after this many XNU kprintf lines (0: no limit) */
@@ -1228,6 +1239,18 @@ static int enter_arm_init(struct boot_args_v2 *ba)
 		cpu_thread[c] = fki_thread_start(cpu_fn, (void *)(unsigned long)c, c, "xnu-cpu");
 		if (!cpu_thread[c]) { logkv("xnu: cannot make a thread for CPU, running with CPUs below it:", (u64_t)c); cpus = c; }
 	}
+	if (xnu_nopauth_lower) {
+		logkv("xnu: nopauth RETAA/RETAB rewritten", xnu_lower_stats.ret);
+		logkv("xnu: nopauth BLRA* rewritten", xnu_lower_stats.blr);
+		logkv("xnu: nopauth BRA* rewritten", xnu_lower_stats.br);
+		logkv("xnu: nopauth PAC inserts nopped", xnu_lower_stats.pac_nop);
+		logkv("xnu: nopauth pointers canonicalized", xnu_lower_stats.canon);
+		logkv("xnu: nopauth branches left raw", xnu_lower_stats.branch_raw);
+		logkv("xnu: nopauth MRS key -> XZR", xnu_lower_stats.mrs);
+		logkv("xnu: nopauth MSR key nopped", xnu_lower_stats.msr);
+		logkv("xnu: nopauth HINT PAC rewritten to NOP", xnu_lower_stats.hint);
+		logkv("xnu: nopauth ERETAA/ERETAB left in place", xnu_lower_stats.refused);
+	}
 	logs("xnu: entering arm_init");
 	in_xnu = 1;
 	long r = xnu_world_call(a_init, (unsigned long)ba);
@@ -1318,6 +1341,51 @@ static int run_m2b(void)
 	return enter_arm_init(ba);
 }
 
+/*
+ * Host pointer authentication. On a CPU with FEAT_PAuth the original key switch is unchanged.
+ * Without it, fki_enter's MRS/MSR of APIAKey*_EL1 (and the other four pairs) is UNDEFINED, and so
+ * are the guest's non-HINT PAC instructions (RETAB, BLRAAZ, PACIA Xd,Xn, MSR of the same keys).
+ * HINT-space PACIASP/AUTIASP would NOP; Apple arm64e returns with RETAB. QARMA3 (APA3/GPA3) is a
+ * different algorithm from Apple's implementation-defined one, and it is not implemented here when
+ * those fields are zero. Neither fact makes the guest runnable. No image is opened and no contiguous
+ * DRAM is allocated on the way out.
+ * Returns 0 to continue, 1 when pauth_probe finished on a PAC host, or -errno.
+ */
+static int xnu_pauth_gate(void)
+{
+	fki_u64 isar1 = 0, isar2 = 0, sctlr = 0, el = 0, fields = 0;
+	int present = fki_pauth_status(&isar1, &isar2, &sctlr, &el, &fields);
+
+	logkv("xnu: pauth isar1", isar1);
+	logkv("xnu: pauth isar2", isar2);
+	logkv("xnu: pauth sctlr_el1", sctlr);
+	logkv("xnu: pauth CurrentEL", el);
+	logkv("xnu: pauth fields apa.api.gpa.gpi.apa3.gpa3", fields);
+	if (present) {
+		if (nopauth)
+			logs_alert("xnu: nopauth ignored: host FEAT_PAuth is present; original PAC key switch stays");
+		if (pauth_probe) {
+			logs_alert("xnu: pauth_probe: FEAT_PAuth present. No image opened, no DRAM allocated.");
+			return 1;
+		}
+		return 0;
+	}
+	logs_alert("xnu: host FEAT_PAuth absent. Original fki_enter would MRS APIAKEYLO_EL1, which is UNDEFINED. Key registers not touched.");
+	if (pauth_probe) {
+		logs_alert("xnu: pauth_probe: no image opened, no contiguous DRAM allocated.");
+		return -EOPNOTSUPP;
+	}
+	if (!nopauth) {
+		logs_alert("xnu: not entering. nopauth=1 rewrites guest PAC instructions to RET/BLR/NOP and enters. That drops guest PAC checks.");
+		return -EOPNOTSUPP;
+	}
+	xnu_nopauth_lower = 1;
+	logs_alert("xnu: nopauth: experimental. Guest PAC instructions are rewritten; pointers are not authenticated. Not macOS support.");
+	logs_alert("xnu: nopauth: RETAB->RET, BLRA*->BLR, BRA*->BR. PACIBSP is already a NOP without FEAT_PAuth and is rewritten to NOP. AUT/XPAC->SBFX. ERETAA/ERETAB are not rewritten.");
+	logs_alert("xnu: nopauth: SBFX is placed in a PAC insert immediately before BLRA*/BRA* of the same register, or in PACIBSP immediately before RETAB. A bare BLRA* stays a raw branch.");
+	return 0;
+}
+
 static int __init xnu_init(void)
 {
 	const void *data; unsigned long size;
@@ -1325,6 +1393,9 @@ static int __init xnu_init(void)
 
 	if (fki_version() != 0)
 		return -22;
+	err = xnu_pauth_gate();
+	if (err)
+		return err < 0 ? err : 0;
 	/* every random number XNU takes comes from Linux's generator (the boot seeds, LINUX64_CALL_RANDOM): seeded first */
 	err = fki_random_wait();
 	if (err) { logkv("xnu: Linux's random number generator is not seeded, err", (u64_t)err); return err; }

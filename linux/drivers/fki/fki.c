@@ -97,6 +97,11 @@ EXPORT_SYMBOL(fki_blob_put);
 
 static void keys_read(struct fki_pac_keys *k)
 {
+	/*
+	 * In-tree snapshot of the same switch. Out of tree, fki-ko/fki_mod.c reads ID_AA64ISAR1_EL1 /
+	 * ID_AA64ISAR2_EL1 first and does not touch these registers when APA, API, GPA, GPI, APA3 and GPA3
+	 * are all zero: the accesses are UNDEFINED without FEAT_PAuth. This copy has no such gate.
+	 */
 	k->ia[0] = read_sysreg_s(SYS_APIAKEYLO_EL1); k->ia[1] = read_sysreg_s(SYS_APIAKEYHI_EL1);
 	k->ib[0] = read_sysreg_s(SYS_APIBKEYLO_EL1); k->ib[1] = read_sysreg_s(SYS_APIBKEYHI_EL1);
 	k->da[0] = read_sysreg_s(SYS_APDAKEYLO_EL1); k->da[1] = read_sysreg_s(SYS_APDAKEYHI_EL1);

@@ -8,6 +8,8 @@
  */
 #include "fki.h"
 #include "fki_internal.h"
+#include "fki_pauth.h"
+#include "fki_symcheck.h"
 #include <linux/firmware.h>
 #include <linux/gfp.h>
 #include <linux/irqflags.h>
@@ -79,6 +81,42 @@ static unsigned long p_stext, p_end;
 static u64 *p_kimage_voffset;
 static int (*p_efi_mem_type)(unsigned long);	/* the firmware's memory map: is the carve-out RAM at all */
 
+/*
+ * Default empty. Runtime addresses for the RB5 System.map in fki_rb5_link, same order.
+ * Used only when set. Checked as one KASLR slide. Not a kallsyms scan.
+ * Fault and die hooks still call register_kprobe; this kernel has no kprobes.
+ */
+static unsigned long sym_runtime[FKI_SYM_N];
+static int sym_runtime_n;
+module_param_array(sym_runtime, ulong, &sym_runtime_n, 0444);
+MODULE_PARM_DESC(sym_runtime, "optional runtime addresses matching fki_rb5_link order; default off");
+
+static int fki_resolve_explicit(void)
+{
+	unsigned long slide = 0;
+
+	if (sym_runtime_n != FKI_SYM_N)
+		return -EINVAL;
+	if (fki_sym_one_slide(fki_rb5_link, sym_runtime, FKI_SYM_N, &slide)) {
+		pr_alert("fki: sym_runtime is not one slide from the RB5 System.map; not using it\n");
+		return -EINVAL;
+	}
+	p_set_memory_x = (set_memory_fn)sym_runtime[0];
+	p_alloc_contig = (alloc_contig_fn)sym_runtime[1];
+	p_free_contig = (free_contig_fn)sym_runtime[2];
+	p_cma_area = (struct cma **)sym_runtime[3];
+	p_cma_alloc = (void *)sym_runtime[4];
+	p_cma_release = (void *)sym_runtime[5];
+	p_set_memory_nx = (set_memory_fn)sym_runtime[6];
+	p_stext = sym_runtime[7];
+	p_end = sym_runtime[8];
+	p_kimage_voffset = (u64 *)sym_runtime[9];
+	p_efi_mem_type = (void *)sym_runtime[10];
+	pr_alert("fki: sym_runtime accepted, slide %#lx. Fault hooks still need kprobes, which this config may not have.\n",
+		 slide);
+	return p_set_memory_x && p_set_memory_nx ? 0 : -ENOENT;
+}
+
 static int fki_resolve(void)
 {
 	static unsigned long (*lookup)(const char *);
@@ -86,6 +124,14 @@ static int fki_resolve(void)
 
 	if (p_set_memory_x)
 		return 0;
+	if (sym_runtime_n) {
+		int err = fki_resolve_explicit();
+
+		if (!err)
+			return 0;
+		pr_alert("fki: sym_runtime rejected (%d); not falling through to a kallsyms scan\n", err);
+		return err;
+	}
 	if (!lookup) {
 		if (register_kprobe(&kp))
 			return -ENOENT;
@@ -163,9 +209,71 @@ EXPORT_SYMBOL(fki_blob_put);
 
 #define FKI_SCTLR_EN (SCTLR_ELx_ENIA | SCTLR_ELx_ENIB | SCTLR_ELx_ENDA | SCTLR_ELx_ENDB)
 
+/* -1 until the ID registers have been read. 1: key registers exist. 0: they are UNDEFINED. */
+static int fki_pauth_level = -1;
+static u64 fki_pauth_isar1, fki_pauth_isar2, fki_pauth_sctlr, fki_pauth_el;
+
+static void fki_pauth_detect(void)
+{
+	struct fki_pauth_id id;
+
+	if (smp_load_acquire(&fki_pauth_level) >= 0)
+		return;
+	fki_pauth_isar1 = read_sysreg_s(SYS_ID_AA64ISAR1_EL1);
+	fki_pauth_isar2 = read_sysreg_s(SYS_ID_AA64ISAR2_EL1);
+	fki_pauth_sctlr = read_sysreg(sctlr_el1);
+	fki_pauth_el = read_sysreg(CurrentEL);
+	fki_pauth_decode(fki_pauth_isar1, fki_pauth_isar2, &id);
+	/* CurrentEL is the raw register: EL1 reads as 4 (EL in bits [3:2]). Quiet consoles still show the absent case. */
+	if (id.present)
+		pr_info("fki: pauth isar1=%#llx isar2=%#llx sctlr_el1=%#llx CurrentEL=%#llx EL%llu apa=%u api=%u gpa=%u gpi=%u apa3=%u gpa3=%u present=%u\n",
+			fki_pauth_isar1, fki_pauth_isar2, fki_pauth_sctlr, fki_pauth_el, fki_pauth_el >> 2,
+			id.apa, id.api, id.gpa, id.gpi, id.apa3, id.gpa3, id.present);
+	else
+		pr_alert("fki: pauth isar1=%#llx isar2=%#llx sctlr_el1=%#llx CurrentEL=%#llx EL%llu apa=%u api=%u gpa=%u gpi=%u apa3=%u gpa3=%u present=%u; PAC key registers are UNDEFINED and will not be read or written\n",
+			 fki_pauth_isar1, fki_pauth_isar2, fki_pauth_sctlr, fki_pauth_el, fki_pauth_el >> 2,
+			 id.apa, id.api, id.gpa, id.gpi, id.apa3, id.gpa3, id.present);
+	smp_store_release(&fki_pauth_level, id.present ? 1 : 0);
+}
+
+int fki_pauth_status(fki_u64 *isar1, fki_u64 *isar2, fki_u64 *sctlr_el1, fki_u64 *current_el, fki_u64 *fields)
+{
+	struct fki_pauth_id id;
+
+	fki_pauth_detect();
+	fki_pauth_decode(fki_pauth_isar1, fki_pauth_isar2, &id);
+	if (isar1)
+		*isar1 = fki_pauth_isar1;
+	if (isar2)
+		*isar2 = fki_pauth_isar2;
+	if (sctlr_el1)
+		*sctlr_el1 = fki_pauth_sctlr;
+	if (current_el)
+		*current_el = fki_pauth_el;
+	if (fields)
+		*fields = fki_pauth_pack(&id);
+	return READ_ONCE(fki_pauth_level) > 0;
+}
+EXPORT_SYMBOL(fki_pauth_status);
+
+__attribute__((target("branch-protection=none")))
+static int fki_pauth_keys_ok(void)
+{
+	/*
+	 * Cached by fki_init, before any world switch. fki_leave and fki_pac_swap call this while the foreign
+	 * keys are live, so it must not call printk or anything else signed with the host keys.
+	 * Unknown (init did not run) stays "do not touch the key registers".
+	 */
+	return smp_load_acquire(&fki_pauth_level) > 0;
+}
 
 static __always_inline void keys_read(struct fki_pac_keys *k)
 {
+	/* ID registers said the key registers are UNDEFINED: do not MRS them (it is an undef at EL1). */
+	if (!fki_pauth_keys_ok()) {
+		memset(k, 0, sizeof(*k));
+		return;
+	}
 	k->ia[0] = read_sysreg_s(SYS_APIAKEYLO_EL1); k->ia[1] = read_sysreg_s(SYS_APIAKEYHI_EL1);
 	k->ib[0] = read_sysreg_s(SYS_APIBKEYLO_EL1); k->ib[1] = read_sysreg_s(SYS_APIBKEYHI_EL1);
 	k->da[0] = read_sysreg_s(SYS_APDAKEYLO_EL1); k->da[1] = read_sysreg_s(SYS_APDAKEYHI_EL1);
@@ -176,6 +284,8 @@ static __always_inline void keys_read(struct fki_pac_keys *k)
 
 static __always_inline void keys_write(const struct fki_pac_keys *k)
 {
+	if (!fki_pauth_keys_ok())
+		return;
 	write_sysreg_s(k->ia[0], SYS_APIAKEYLO_EL1); write_sysreg_s(k->ia[1], SYS_APIAKEYHI_EL1);
 	write_sysreg_s(k->ib[0], SYS_APIBKEYLO_EL1); write_sysreg_s(k->ib[1], SYS_APIBKEYHI_EL1);
 	write_sysreg_s(k->da[0], SYS_APDAKEYLO_EL1); write_sysreg_s(k->da[1], SYS_APDAKEYHI_EL1);
@@ -974,6 +1084,8 @@ static int __init fki_init(void)
 	struct net_device *dev;
 	int err, cpu;
 
+	/* Process context, IRQs on. The ID registers only; PAC key registers stay untouched. */
+	fki_pauth_detect();
 	for_each_possible_cpu(cpu) {
 		struct page *pg = alloc_pages(GFP_KERNEL, FKI_ALT_STACK_ORDER);
 
